@@ -14,11 +14,11 @@ from .functional import moe_TC_softmax_topk_layer
 
 
 try:
-    from fma.modules.moe import scattered_experts
+    from xma.modules.moe import scattered_experts
 
-    _IS_FMA_AVAILABLE = True
+    _IS_XMA_AVAILABLE = True
 except:
-    _IS_FMA_AVAILABLE = False
+    _IS_XMA_AVAILABLE = False
 
 
 def _swiglu(x: torch.Tensor) -> torch.Tensor:
@@ -57,9 +57,9 @@ class Experts(nn.Module):
     ) -> torch.Tensor:
         assert self.bias is None
 
-        if not _IS_FMA_AVAILABLE:
+        if not _IS_XMA_AVAILABLE:
             raise ImportError(
-                "install flash-model-architectures from https://github.com/open-lm-engine/flash-model-architectures"
+                "install accelerated-model-architectures from https://github.com/open-lm-engine/accelerated-model-architectures"
             )
 
         input = scattered_experts(
@@ -87,9 +87,9 @@ class Experts(nn.Module):
     ) -> torch.Tensor:
         assert self.bias is None
 
-        if not _IS_FMA_AVAILABLE:
+        if not _IS_XMA_AVAILABLE:
             raise ImportError(
-                "install flash-model-architectures from https://github.com/open-lm-engine/flash-model-architectures"
+                "install accelerated-model-architectures from https://github.com/open-lm-engine/accelerated-model-architectures"
             )
 
         input = scattered_experts(
