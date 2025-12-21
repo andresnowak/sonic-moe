@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 
 from sonicmoe import MoE
 from sonicmoe.functional import count_cumsum, moe_general_routing_inputs
+from sonicmoe.enums import ActivationType
 from triton.testing import do_bench
 
 
@@ -101,7 +102,7 @@ def parse_arguments() -> argparse.Namespace:
 
 def our_e2e_fwd_bwd_call(x, router_scores_selected, sorted_selected_T, selected_E, w1, b1, w2, b2, E, stream_id, dout):
     o, _ = moe_general_routing_inputs(
-        x, router_scores_selected, sorted_selected_T, selected_E, w1, b1, w2, b2, E, stream_id, False
+        x, router_scores_selected, sorted_selected_T, selected_E, w1, b1, w2, b2, E, stream_id, ActivationType.SWIGLU, False
     )
     torch.autograd.grad(o, [x, router_scores_selected, w1, w2], dout, retain_graph=True)
     router_scores_selected.grad = x.grad = w1.grad = w2.grad = None
@@ -109,7 +110,7 @@ def our_e2e_fwd_bwd_call(x, router_scores_selected, sorted_selected_T, selected_
 
 def our_fwd_call(x, router_scores_selected, sorted_selected_T, selected_E, w1, b1, w2, b2, E, stream_id):
     return moe_general_routing_inputs(
-        x, router_scores_selected, sorted_selected_T, selected_E, w1, b1, w2, b2, E, stream_id, False
+        x, router_scores_selected, sorted_selected_T, selected_E, w1, b1, w2, b2, E, stream_id, ActivationType.SWIGLU, False
     )
 
 
@@ -218,6 +219,7 @@ def run(
             num_experts_per_tok=K,
             hidden_size=H,
             intermediate_size=I,
+            activation_function=ActivationType.SWIGLU,
             is_glu=True,
             add_bias=add_bias,
             std=0.02,
@@ -267,6 +269,7 @@ def run(
             b2,
             E,
             stream_id,
+            ActivationType.SWIGLU,
             False,
         )
         if add_bias:
