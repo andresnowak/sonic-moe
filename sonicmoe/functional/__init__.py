@@ -68,7 +68,7 @@ def general_routing_router_metadata(
         s_scatter_idx.size(0), device=s_scatter_idx.device, dtype=s_scatter_idx.dtype
     )
 
-    x_gather_idx = sorted_selected_T[s_scatter_idx]
+    x_gather_idx = sorted_selected_T[s_scatter_idx] # the sorted by expert token indices
 
     if T % 4 == 0 and T <= 50000:
         _, num_activated_expert_per_token_offset = count_cumsum(sorted_selected_T, T, do_cumsum=True)
@@ -303,6 +303,7 @@ class _DownProjection(torch.autograd.Function):
         num_activated_expert_per_token_offset: torch.Tensor,
         is_varlen_K: bool,
         activation_type: ActivationType,
+        weighted_sum_enabled: bool = True,
     ) -> torch.Tensor:
         TK = y1.size(0)
         H, I, E = w2.shape
@@ -325,19 +326,24 @@ class _DownProjection(torch.autograd.Function):
                 stream_id=stream_id,
             )
 
-        o = torch.empty(T, H, device=z.device, dtype=z.dtype)
-        topk_scores = topk_scores.flatten()
+        o = None
+        if weighted_sum_enabled:
+            # weighted sum with topk scores
+            o = torch.empty(T, H, device=z.device, dtype=z.dtype)
+            topk_scores = topk_scores.flatten()
 
-        _router_forward(
-            y2=y2,
-            o=o,
-            topk_scores=topk_scores,
-            s_reverse_scatter_idx=s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
-            varlen_K_max=(E if is_varlen_K else K),
-            H=H,
-            is_varlen_K=is_varlen_K,
-        )
+            _router_forward(
+                y2=y2,
+                o=o,
+                topk_scores=topk_scores,
+                s_reverse_scatter_idx=s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
+                varlen_K_max=(E if is_varlen_K else K),
+                H=H,
+                is_varlen_K=is_varlen_K,
+            )
+        else:
+            o = y2 # don't do the expert weighted sum for now (as token_dispatcher in Megatron never applies the probs, it only does the weighted sum in the unpermute step)
 
         ctx.T = T
         ctx.K = K
@@ -451,7 +457,8 @@ class _DownProjection(torch.autograd.Function):
         if not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dz, dw2, db2, ds, *[None] * 10
+        # NOTE: we now use 11 because we added the weighted_sum_enabled argument in forward
+        return None, dz, dw2, db2, ds, *[None] * 11
 
 
 def moe_TC_softmax_topk_layer(
@@ -534,13 +541,13 @@ def moe_TC_softmax_topk_layer(
 #   and len(token_indices) = len(expert_indices) = len(router_scores)
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 def moe_general_routing_inputs(
-    x: torch.Tensor,
-    router_scores: torch.Tensor,
-    token_indices: torch.Tensor,
-    expert_indices: torch.Tensor,
-    w1: torch.Tensor,
+    x: torch.Tensor, # [T, H]
+    router_scores: torch.Tensor, # [TK]
+    token_indices: torch.Tensor, # [TK]
+    expert_indices: torch.Tensor, # [TK]
+    w1: torch.Tensor, # [2*I, H, E]
     b1: torch.Tensor | None,
-    w2: torch.Tensor,
+    w2: torch.Tensor, # [H, I, E]
     b2: torch.Tensor | None,
     E: int,
     stream_id: int,
@@ -596,6 +603,97 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
         True,  # is_varlen_K
         activation_type,
+    )
+
+    return o, expert_frequency
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# Weight format requirements:
+# NOTE: I think previous weight format comment in the function above is wrong
+# - w1_weight: Shape (2*I, H, E), stride order (1, 0 2),
+# - w2_weight: Shape (H, I, E), stride order (1, 0, 2)
+
+# We assume expert_indices is already SORTED ascendingly !!!
+#   and len(expert_indices) = len(router_scores) = len(token_indices)
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+def moe_sorted_by_experts_input(
+    x: torch.Tensor,  # [M, H] where M = total tokens received on this GPU (with repetitions)
+    router_scores: torch.Tensor,  # [M] - one score per token instance
+    expert_indices: torch.Tensor,  # [M] - local expert ID for each token instance
+    token_indices: torch.Tensor,  # [M] - original token indices for each token instance
+    w1: torch.Tensor,  # [2*I, H, E_local]
+    b1: torch.Tensor | None,
+    w2: torch.Tensor,  # [H, I, E_local]
+    b2: torch.Tensor | None,
+    E: int,  # E_local - number of experts on this GPU
+    stream_id: int,
+    activation_type: ActivationType,
+    is_inference_mode_enabled: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    MoE forward for expert-sorted inputs in Expert Parallelism.
+
+    Args:
+        x: [M, H] where M is total token instances (with repetitions from routing)
+        K: Global top-k value, required for backward pass. Doesn't reflect local structure.
+
+    Returns:
+        Output [M, H] in expert-sorted order, same as input
+    """
+    assert ((b1 is None) and (b2 is None)) or (
+        (b1 is not None) and (b2 is not None)
+    ), "b1 and b2 has to be None or not None at the same time!"
+
+    M = x.size(0)  # Total token instances on this GPU
+    E_local = E
+    device = x.device
+
+    # Compute expert frequencies
+    expert_frequency, expert_frequency_offset = count_cumsum(expert_indices, E_local, do_cumsum=True)
+    expert_frequency_offset = torch.cat([torch.zeros(1, dtype=torch.int32, device=device), expert_frequency_offset])
+
+    # Identity mappings for pre-sorted by expert data
+    x_gather_idx = torch.arange(M, dtype=torch.int32, device=device)
+    s_scatter_idx = torch.arange(M, dtype=torch.int32, device=device)
+    s_reverse_scatter_idx = torch.arange(M, dtype=torch.int32, device=device)
+
+    num_activated_expert_per_token_offset = torch.arange(
+        0, M + 1, dtype=torch.int32, device=device)
+
+    y1, z = _UpProjection.apply(
+        x,
+        w1,
+        b1,
+        expert_frequency_offset,
+        M, # total expert freq
+        None,  # K
+        stream_id,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+        True,  # is_varlen_K
+        activation_type,
+        is_inference_mode_enabled,
+    )
+
+    o = _DownProjection.apply(
+        y1,
+        z,
+        w2,
+        b2,
+        router_scores,
+        expert_frequency_offset,
+        M,  # T but we are putting TK_local (output size) instead as that is the amount of values we have in x
+        None,  # K
+        stream_id,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+        True,  # is_varlen_K
+        activation_type,
+        False,  # weighted_sum_enabled
     )
 
     return o, expert_frequency
