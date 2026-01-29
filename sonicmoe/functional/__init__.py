@@ -619,8 +619,7 @@ def moe_general_routing_inputs(
 def moe_sorted_by_experts_input(
     x: torch.Tensor,  # [M, H] where M = total tokens received on this GPU (with repetitions)
     router_scores: torch.Tensor,  # [M] - one score per token instance
-    expert_indices: torch.Tensor,  # [M] - local expert ID for each token instance
-    token_indices: torch.Tensor,  # [M] - original token indices for each token instance
+    expert_frequency_offset: torch.Tensor,  # [E_local + 1] - cumsum of tokens per expert on this GPU
     w1: torch.Tensor,  # [2*I, H, E_local]
     b1: torch.Tensor | None,
     w2: torch.Tensor,  # [H, I, E_local]
@@ -649,8 +648,8 @@ def moe_sorted_by_experts_input(
     device = x.device
 
     # Compute expert frequencies
-    expert_frequency, expert_frequency_offset = count_cumsum(expert_indices, E_local, do_cumsum=True)
-    expert_frequency_offset = torch.cat([torch.zeros(1, dtype=torch.int32, device=device), expert_frequency_offset])
+    # expert_frequency, expert_frequency_offset = count_cumsum(expert_indices, E_local, do_cumsum=True)
+    # expert_frequency_offset = torch.cat([torch.zeros(1, dtype=torch.int32, device=device), expert_frequency_offset])
 
     # Identity mappings for pre-sorted by expert data
     x_gather_idx = torch.arange(M, dtype=torch.int32, device=device)
@@ -696,4 +695,4 @@ def moe_sorted_by_experts_input(
         False,  # weighted_sum_enabled
     )
 
-    return o, expert_frequency
+    return o, None
