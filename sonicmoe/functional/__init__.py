@@ -53,6 +53,38 @@ def TC_topk_router_metadata(
     )
 
 
+# Credits to: https://github.com/GHtyt/sonic-moe/blob/expert_parallel/sonicmoe/functional/__init__.py
+def expert_parallel_TC_topk_router_metadata(
+    topk_router_indices: torch.Tensor, expert_frequency_offset, K: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    invalid_tokens = torch.sum(topk_router_indices == -1)
+    s_scatter_idx = torch.argsort(topk_router_indices.view(-1)).int()
+    expert_frequency_offset = torch.cat([torch.zeros(1, device=expert_frequency_offset.device, dtype=expert_frequency_offset.dtype), expert_frequency_offset])
+
+    num_activated_expert_per_token_offset = (topk_router_indices > -1).sum(dim=-1)
+    num_activated_expert_per_token_offset = torch.cat([torch.tensor([0], device=num_activated_expert_per_token_offset.device, dtype=num_activated_expert_per_token_offset.dtype), num_activated_expert_per_token_offset])
+    num_activated_expert_per_token_offset = num_activated_expert_per_token_offset.cumsum(0)
+
+    x_gather_idx = s_scatter_idx // K
+
+
+    topk_router_indices_valid = topk_router_indices[topk_router_indices >= 0]
+    s_scatter_idx_valid = torch.argsort(topk_router_indices_valid.view(-1)).int()
+    s_reverse_scatter_idx_valid = torch.empty_like(s_scatter_idx_valid)
+    s_reverse_scatter_idx_valid[s_scatter_idx_valid] = torch.arange(
+        s_scatter_idx_valid.shape[0], device=s_scatter_idx_valid.device, dtype=s_scatter_idx_valid.dtype
+    )
+
+    return (
+        expert_frequency_offset,
+        x_gather_idx[invalid_tokens:],
+        s_scatter_idx_valid,
+        s_reverse_scatter_idx_valid,
+        num_activated_expert_per_token_offset,
+    )
+
+
 def general_routing_router_metadata(
     router_scores_selected: torch.Tensor, sorted_selected_T: torch.Tensor, selected_E: torch.Tensor, T: int, E: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
