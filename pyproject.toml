@@ -8,14 +8,19 @@ version = "0.0.1"
 description = "High-performance Mixture-of-Experts implementation for NVIDIA Hopper GPUs"
 readme = "README.md"
 requires-python = ">=3.12"
+authors = []
 dependencies = [
-    "torch>=2.7.1",
-    "triton",
+    "cuda-python==13.1.1",
     "nvidia-cutlass-dsl==4.2.1",
     "quack-kernels @ git+https://github.com/Dao-AILab/quack.git@3d0ab3ec2164749caac8f269f771e66a40efd2de",
 ]
 
 [project.optional-dependencies]
+# Install with: pip/uv install .[gpu]
+gpu = [
+    "torch>=2.7.1",
+    "triton",
+]
 dev = [
     "pytest",
     "parameterized",
@@ -52,18 +57,6 @@ exclude-dependencies = [
     "nvidia-cusparse-cu12",
     "nvidia-cusparselt-cu12",
     "nvidia-nccl-cu12",
-    "nvidia-cublas-cu13",
-    "nvidia-cuda-cupti-cu13",
-    "nvidia-cuda-nvrtc-cu13",
-    "nvidia-cuda-runtime-cu13",
-    "nvidia-cudnn-cu13",
-    "nvidia-cufft-cu13",
-    "nvidia-cufile-cu13",
-    "nvidia-curand-cu13",
-    "nvidia-cusolver-cu13",
-    "nvidia-cusparse-cu13",
-    "nvidia-cusparselt-cu13",
-    "nvidia-nccl-cu13",
 ]
 
 [tool.isort]
