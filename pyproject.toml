@@ -1,0 +1,79 @@
+# ********************************************************************************
+# Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
+# ********************************************************************************
+
+[project]
+name = "sonicmoe"
+version = "0.0.1"
+description = "High-performance Mixture-of-Experts implementation for NVIDIA Hopper GPUs"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.7.1",
+    "triton",
+    "nvidia-cutlass-dsl==4.2.1",
+    "quack-kernels @ git+https://github.com/Dao-AILab/quack.git@3d0ab3ec2164749caac8f269f771e66a40efd2de",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "parameterized",
+    "ninja",
+    "rich",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["./"]
+
+[tool.setuptools.package-data]
+"*" = ["**/*.cu", "**/*.cpp", "**/*.cuh", "**/*.h", "**/*.pyx", "**/*.yml"]
+
+[tool.uv]
+# In NGC/PyTorch containers torch, triton, and CUDA libs are pre-installed.
+# uv will resolve them but skip actual installation.
+exclude-dependencies = [
+    "torch",
+    "torchvision",
+    "triton",
+    "nvidia-cublas-cu12",
+    "nvidia-cuda-cupti-cu12",
+    "nvidia-cuda-nvrtc-cu12",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cudnn-cu12",
+    "nvidia-cufft-cu12",
+    "nvidia-cufile-cu12",
+    "nvidia-curand-cu12",
+    "nvidia-cusolver-cu12",
+    "nvidia-cusparse-cu12",
+    "nvidia-cusparselt-cu12",
+    "nvidia-nccl-cu12",
+    "nvidia-cublas-cu13",
+    "nvidia-cuda-cupti-cu13",
+    "nvidia-cuda-nvrtc-cu13",
+    "nvidia-cuda-runtime-cu13",
+    "nvidia-cudnn-cu13",
+    "nvidia-cufft-cu13",
+    "nvidia-cufile-cu13",
+    "nvidia-curand-cu13",
+    "nvidia-cusolver-cu13",
+    "nvidia-cusparse-cu13",
+    "nvidia-cusparselt-cu13",
+    "nvidia-nccl-cu13",
+]
+
+[tool.isort]
+ensure_newline_before_comments = true
+force_grid_wrap = 0
+include_trailing_comma = true
+line_length = 119
+lines_after_imports = 2
+multi_line_output = 3
+use_parentheses = true
+
+[tool.black]
+line-length = 119
