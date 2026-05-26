@@ -3,19 +3,132 @@
 # ********************************************************************************
 
 import argparse
+import itertools
 import random
+from functools import partial
 from typing import Tuple, Type
 
 import cutlass
+import quack.autotuner
+import quack.gemm_config as _gc
 import torch
 import torch.nn.functional as F
+from quack.autotuner import AutotuneConfig
+from quack.gemm_config import GemmConfig
+from quack.gemm_interface import gemm_dgated_tuned, gemm_gated_tuned, gemm_tuned
 from rich import print as print0
 from tqdm.auto import tqdm
 from triton.testing import do_bench
 
 from sonicmoe import MoE
 from sonicmoe.enums import ActivationType
-from sonicmoe.functional import count_cumsum, moe_general_routing_inputs
+from sonicmoe.functional import moe_general_routing_inputs
+
+
+# ─────────────── Monkey-patch: similar M shapes map to the same cached config during QuACK autotuning ───────────────
+
+M_QUANT = 1024
+
+
+def _make_quantized_key(self, args, kwargs):
+    all_args = {**dict(zip(self.arg_names, args)), **kwargs}
+    _args = {k: v for k, v in all_args.items() if k in self.arg_names}
+    key = [str(_args[k]) for k in self.keys if k in _args]
+    for _, arg in _args.items():
+        if isinstance(arg, torch.Tensor):
+            s = list(arg.shape)
+            # Quantize the M (first) dimension
+            if s and s[0] >= M_QUANT:
+                s[0] = ((s[0] + M_QUANT - 1) // M_QUANT) * M_QUANT
+            key.append(str(tuple(s)))
+            key.append(str([x if x in {0, 1} else 2 for x in arg.stride()]))
+            key.append(str(arg.dtype))
+    return tuple(key)
+
+
+_orig_call = quack.autotuner.Autotuner.__call__
+
+
+@torch.compiler.disable
+def _patched_call(self, *args, **kwargs):
+    if len(self.configs) > 1:
+        qkey = _make_quantized_key(self, args, kwargs)
+        if qkey in self.cache:
+            # Cache hit on quantized key — skip autotuning
+            config = self.cache[qkey]
+            self.best_config = config
+            self.nargs = dict(zip(self.arg_names, args))
+            ret = self.fn.__call__(*args, **kwargs, **config.all_kwargs())
+            self.nargs = None
+            return ret
+
+    # Cache miss — fall through to original autotuning
+    ret = _orig_call(self, *args, **kwargs)
+
+    # Store result under quantized key so future similar-M calls hit cache
+    if len(self.configs) > 1 and hasattr(self, "best_config"):
+        qkey = _make_quantized_key(self, args, kwargs)
+        self.cache[qkey] = self.best_config
+
+    return ret
+
+
+quack.autotuner.Autotuner.__call__ = _patched_call
+# ─────────────── Monkey-patch ends ───────────────
+
+
+# ─────────────── Monkey-patch: reduce SM100 autotuning ───────────────
+# !!!!!!!!!! The following code is to accelerate the autotuning process in QuACK and IS REMOVABLE (does not affect correctness) !!!!!!!!!!
+
+
+def _fast_sm100_configs(epilogue=None):
+    tile_n_vals = [128, 160, 192, 256]
+    tile_mn_cluster_vals = (
+        [(128, tile_n, (1, 2)) for tile_n in tile_n_vals]
+        + [(128, tile_n, (2, 1)) for tile_n in tile_n_vals]
+        + [(256, tile_n, (2, 1)) for tile_n in tile_n_vals]
+        + [(256, 512, (2, 1))]
+    )
+    swap_ab_vals = [False, True]
+    if epilogue in ["lse", "gated"]:
+        swap_ab_vals = [False]
+    GemmConfigCls = partial(GemmConfig, pingpong=False, device_capacity=10)
+    use_clc_vals = [True, False]
+    use_tma_gather_vals = [True, False]
+    return [
+        GemmConfigCls(
+            tile_m=m,
+            tile_n=n,
+            cluster_m=cm,
+            cluster_n=cn,
+            swap_ab=sab,
+            max_swizzle_size=8,
+            is_dynamic_persistent=use_clc,
+            use_tma_gather=use_tma_gather,
+        )
+        for (m, n, (cm, cn)), sab, use_clc, use_tma_gather in itertools.product(
+            tile_mn_cluster_vals, swap_ab_vals, use_clc_vals, use_tma_gather_vals
+        )
+    ]
+
+
+_gc._get_sm100_configs = _fast_sm100_configs
+
+
+def _patch_autotuner_configs(autotuner_fn):
+    all_new = [AutotuneConfig(config=c) for c in _gc.get_all_configs()]
+    autotuner_fn.configs = all_new
+
+
+# Patch the 3 autotuners used in MoE SwiGLU fwd+bwd
+_patch_autotuner_configs(gemm_tuned)
+_patch_autotuner_configs(gemm_gated_tuned)
+_patch_autotuner_configs(gemm_dgated_tuned)
+
+gemm_gated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs("gated")]
+gemm_dgated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs("gated")]
+
+# ─────────────── Monkey-patch ends ───────────────
 
 
 @torch.autocast(device_type="cuda", dtype=torch.float32)
@@ -29,6 +142,7 @@ def ref_moe_token_rounding(
     w2: torch.Tensor,
     b2: torch.Tensor | None,
     E,
+    concat_layout: bool = False,
 ):
     T, D = x.shape  # # B, L, # total expert
 
@@ -41,7 +155,11 @@ def ref_moe_token_rounding(
         if T_idx.numel() > 0:
 
             w1_out = F.linear(x[T_idx, :], w1[i, :, :].squeeze(), bias=(b1[i] if b1 is not None else None))
-            w1_out = F.silu(w1_out[:, ::2]) * w1_out[:, 1::2]
+            if concat_layout:
+                g, u = torch.chunk(w1_out, 2, dim=-1)
+                w1_out = F.silu(g) * u
+            else:
+                w1_out = F.silu(w1_out[:, ::2]) * w1_out[:, 1::2]
 
             w2_out = F.linear(w1_out, w2[i, :, :].squeeze(), bias=(b2[i] if b2 is not None else None))
 
@@ -92,6 +210,12 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         default=False,
     )
+    parser.add_argument(
+        "--concat_layout",
+        action="store_true",
+        default=False,
+        help="Use concat [gate; up] weight layout instead of interleaved",
+    )
     args = parser.parse_args()
 
     if len(args.thiekq) != 6:
@@ -100,7 +224,9 @@ def parse_arguments() -> argparse.Namespace:
     return args
 
 
-def our_e2e_fwd_bwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E, stream_id, dout):
+def our_e2e_fwd_bwd_call(
+    x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E, dout, concat_layout=False
+):
     o, _ = moe_general_routing_inputs(
         x,
         router_scores,
@@ -111,15 +237,16 @@ def our_e2e_fwd_bwd_call(x, router_scores, token_indices, expert_indices, w1, b1
         w2,
         b2,
         E,
-        stream_id,
+        None,
         ActivationType.SWIGLU,
         False,
+        concat_layout=concat_layout,
     )
     torch.autograd.grad(o, [x, router_scores, w1, w2], dout, retain_graph=True)
     router_scores.grad = x.grad = w1.grad = w2.grad = None
 
 
-def our_fwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E, stream_id):
+def our_fwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E, concat_layout=False):
     return moe_general_routing_inputs(
         x,
         router_scores,
@@ -130,9 +257,10 @@ def our_fwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2
         w2,
         b2,
         E,
-        stream_id,
+        None,
         ActivationType.SWIGLU,
         False,
+        concat_layout=concat_layout,
     )
 
 
@@ -143,23 +271,20 @@ def forward_token_choice_rounding(
     Mtile = 128
 
     device = x.device
-    dtype = x.dtype
 
     router_logits = F.linear(x, router_w)
-    router_scores = F.softmax(router_logits, dim=-1, dtype=torch.float32).to(dtype)
+    router_scores = F.softmax(router_logits, dim=-1, dtype=torch.float32)
 
     # first sorting, similar to TC
     topk_values, topk_indices = router_scores.topk(K, dim=-1)
 
-    expert_freq = count_cumsum(topk_indices.view(-1), E, do_cumsum=True)[0]
+    expert_freq = torch.bincount(topk_indices.view(-1), minlength=E).int()
     expert_freq_rounded_up = (torch.ceil(expert_freq / Mtile) * Mtile).type(torch.int32)
     expert_freq_rounded_down = expert_freq // Mtile * Mtile
 
     topk_values /= topk_values.sum(dim=-1, keepdim=True)
 
-    router_scores.scatter_(-1, topk_indices, topk_values)
-
-    router_TC_EC_combined_val = router_scores.detach().clone()
+    router_TC_EC_combined_val = router_scores.scatter(-1, topk_indices, topk_values).detach()
     router_TC_EC_combined_val -= 1  # make sure EC's score is lower than TC & EC keeps the score order
     router_TC_EC_combined_val.scatter_(1, topk_indices, topk_values)  # mask out original TC score
 
@@ -214,6 +339,7 @@ def run(
     routing: str,
     skip_test: Type[bool],
     add_bias: Type[bool],
+    concat_layout: bool = False,
     **kwargs,
 ):
 
@@ -257,8 +383,6 @@ def run(
     b1, b2 = moe.c_fc.bias, moe.c_proj.bias
     router_w = moe.router.weight
 
-    stream_id = moe.stream_id
-
     if add_bias:
         torch.nn.init.normal_(b1, 0, 0.01)
         torch.nn.init.normal_(b2, 0, 0.01)
@@ -289,9 +413,10 @@ def run(
             w2.permute(1, 2, 0),
             b2,
             E,
-            stream_id,
+            None,
             ActivationType.SWIGLU,
             False,
+            concat_layout=concat_layout,
         )
         if add_bias:
             dx, dw1, db1, dw2, db2, drouter_w = torch.autograd.grad(
@@ -310,6 +435,7 @@ def run(
             w2,
             b2,
             E,
+            concat_layout=concat_layout,
         )
         ref_expert_frequency = expert_indices.view(-1).bincount(minlength=E)
 
@@ -380,8 +506,8 @@ def run(
             w2.permute(1, 2, 0),
             b2,
             E,
-            stream_id,
             dout,
+            concat_layout=concat_layout,
         )
 
         TK = router_scores.shape[0]
@@ -397,7 +523,7 @@ def run(
                 w2.permute(1, 2, 0),
                 b2,
                 E,
-                stream_id,
+                concat_layout=concat_layout,
             ),
             warmup=10,
             rep=rep,
@@ -420,8 +546,8 @@ def run(
                 w2.permute(1, 2, 0),
                 b2,
                 E,
-                stream_id,
                 dout,
+                concat_layout=concat_layout,
             ),
             warmup=10,
             rep=rep,
@@ -456,5 +582,13 @@ def run(
 
 if __name__ == "__main__":
     args = parse_arguments()
-    run(args.thiekq, args.dtype, args.rep, args.routing, args.skip_test, args.add_bias)
+    run(
+        args.thiekq,
+        args.dtype,
+        args.rep,
+        args.routing,
+        args.skip_test,
+        args.add_bias,
+        concat_layout=args.concat_layout,
+    )
     print("PASS")

@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .count_cumsum import count_cumsum
 from .enums import ActivationType, KernelBackendMoE, is_glu
 from .functional import moe_TC_softmax_topk_layer
 
@@ -17,7 +16,7 @@ try:
     from xma.modules.moe import scattered_experts
 
     _IS_XMA_AVAILABLE = True
-except:
+except ImportError:
     _IS_XMA_AVAILABLE = False
 
 
@@ -216,7 +215,7 @@ class MoE(nn.Module):
         # hidden_states -> (batch_size, query_length, hidden_size)
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
-        if kernel_backend_moe == KernelBackendMoE.sonicmoe:
+        if kernel_backend_moe == KernelBackendMoE.sonicmoe and self.num_experts <= 32768:
             hidden_states, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
                 hidden_states,
                 self.router.weight,
@@ -248,11 +247,14 @@ class MoE(nn.Module):
 
         # hidden_states -> (batch_size, query_length, hidden_size)
 
-        aux_loss = self._compute_switch_loss(
-            logits=router_logits,
-            probs=F.softmax(router_logits, dim=-1, dtype=torch.float32),
-            expert_frequency=expert_frequency,
-        )
+        if is_inference_mode:
+            aux_loss = None
+        else:
+            aux_loss = self._compute_switch_loss(
+                logits=router_logits,
+                probs=F.softmax(router_logits, dim=-1, dtype=torch.float32),
+                expert_frequency=expert_frequency,
+            )
 
         return hidden_states, aux_loss
 
@@ -300,13 +302,8 @@ class MoE(nn.Module):
         with torch.no_grad():
             sorted_expert_idxs, sorted_scattered_idxs = selected_experts.sort()
 
-        is_num_experts_multiple_of_4 = self.num_experts % 4 == 0
-
-        if is_num_experts_multiple_of_4:
-            expert_frequency, expert_offsets = count_cumsum(selected_experts, self.num_experts, do_cumsum=True)
-        else:
-            expert_frequency = selected_experts.bincount(minlength=self.num_experts).to(torch.int32)
-            expert_offsets = expert_frequency.cumsum(-1).to(torch.int32)
+        expert_frequency = selected_experts.bincount(minlength=self.num_experts).to(torch.int32)
+        expert_offsets = expert_frequency.cumsum(-1).to(torch.int32)
 
         act_func = {
             ActivationType.SWIGLU: _swiglu,
